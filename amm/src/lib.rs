@@ -1,4 +1,5 @@
 use anchor_spl::associated_token::get_associated_token_address;
+use bankineco_helpers::{ bank::BankState, oracle::OracleGenState, vault::VaultGenState, * };
 use jupiter_amm_interface::{
     AccountMap,
     Amm,
@@ -8,33 +9,42 @@ use jupiter_amm_interface::{
     QuoteParams,
     Swap,
     SwapAndAccountMetas,
+    SwapMode,
     SwapParams,
+    try_get_account_data,
 };
 use anyhow::Result;
 use solana_sdk::{ instruction::AccountMeta, system_program::ID as SystemProgramId };
 use solana_pubkey::Pubkey;
+use rust_decimal::Decimal;
 
 pub mod constants;
 use constants::*;
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone)]
 pub struct BankinecoAmm {
     bank: Pubkey,
+    bank_state: Option<BankState>,
     vault: Pubkey,
-    team: Pubkey,
+    vault_state: VaultGenState,
     oracle: Pubkey,
+    oracle_state: Option<OracleGenState>,
+    team: Pubkey,
     yielding_mint_program: Pubkey,
 }
 
 impl BankinecoAmm {
-    pub fn new(vault: Pubkey) -> Self {
-        let oracle = Pubkey::default(); // TODO
-        let team = Pubkey::default(); // TODO
+    pub fn new(vault: Pubkey, vault_state: VaultGenState) -> Self {
+        let oracle = Pubkey::find_program_address(&[b"VORACLEA", vault.as_ref()], &PROGRAM_ID).0;
+        let team = Pubkey::find_program_address(&[b"VTEAMA", vault.as_ref()], &PROGRAM_ID).0;
         Self {
             bank: USD_STAR_BANK,
+            bank_state: None,
             vault,
-            team,
+            vault_state,
             oracle,
+            oracle_state: None,
+            team,
             yielding_mint_program: anchor_spl::token::ID,
         }
     }
@@ -49,10 +59,7 @@ pub struct BankinecoSwapAction {
     yielding_mint: Pubkey,
     bank_mint: Pubkey,
     team: Pubkey,
-    system_program: Pubkey,
-    token_program: Pubkey,
     yielding_mint_program: Pubkey,
-    associated_token_program: Pubkey,
 }
 
 impl TryFrom<BankinecoSwapAction> for Vec<AccountMeta> {
@@ -96,7 +103,10 @@ impl Amm for BankinecoAmm {
     fn from_keyed_account(keyed_account: &KeyedAccount, _amm_context: &AmmContext) -> Result<Self>
         where Self: Sized
     {
-        Ok(BankinecoAmm::new(keyed_account.key))
+        let vault_state = VaultGenState::from_data(&keyed_account.account.data).map_err(|e|
+            anyhow::anyhow!("Failed to load vault {:?}", e)
+        )?;
+        Ok(BankinecoAmm::new(keyed_account.key, vault_state))
     }
 
     fn label(&self) -> String {
@@ -116,21 +126,95 @@ impl Amm for BankinecoAmm {
     }
 
     /// The accounts necessary to produce a quote
-    fn get_accounts_to_update(&self) -> Vec<Pubkey> {}
+    fn get_accounts_to_update(&self) -> Vec<Pubkey> {
+        vec![self.bank, self.oracle]
+    }
 
     /// Picks necessary accounts to update it's internal state
     /// Heavy deserialization and precomputation caching should be done in this function
-    fn update(&mut self, account_map: &AccountMap) -> Result<()> {}
+    fn update(&mut self, account_map: &AccountMap) -> Result<()> {
+        let bank_data = try_get_account_data(account_map, &self.bank)?;
+        self.bank_state = Some(
+            BankState::from_data(bank_data).map_err(|e|
+                anyhow::anyhow!("Bank load error: {:?}", e)
+            )?
+        );
 
-    fn quote(&self, quote_params: &QuoteParams) -> Result<Quote> {}
+        let oracle_data = try_get_account_data(account_map, &self.oracle)?;
+        self.oracle_state = Some(
+            OracleGenState::from_data(oracle_data).map_err(|e|
+                anyhow::anyhow!("Oracle load error: {:?}", e)
+            )?
+        );
 
-    /// Indicates which Swap has to be performed along with all the necessary account metas
+        Ok(())
+    }
+
+    fn quote(&self, quote_params: &QuoteParams) -> Result<Quote> {
+        let yielding_mint = Pubkey::from(self.vault_state.config.yielding_token_mint);
+        let is_mint = quote_params.input_mint.eq(&yielding_mint);
+
+        let in_amount = if quote_params.swap_mode == SwapMode::ExactIn {
+            quote_params.amount
+        } else {
+            let bank_mint_price = self.bank_state
+                .unwrap()
+                .calculate_bank_mint_price()
+                .map_err(|e| anyhow::anyhow!("Failed to calculate {:?}", e))?;
+
+            // if is_mint {
+            // } else {
+            // }
+
+            0
+        };
+
+        let (out_amount, fee) = if is_mint {
+            let (out_amount, fee, _) = self.vault_state
+                .calc_yielding_to_bank_mint(
+                    in_amount,
+                    self.bank_state.unwrap().mint.price,
+                    self.bank_state.unwrap().mint.decimals,
+                    self.oracle_state.unwrap().result.yielding_token_price
+                )
+                .map_err(|e| anyhow::anyhow!("Failed to calculate {:?}", e))?;
+
+            (out_amount, fee)
+        } else {
+            let (out_amount, fee, _) = self.vault_state
+                .calc_bank_mint_to_yielding(
+                    in_amount,
+                    self.bank_state.unwrap().mint.price,
+                    self.bank_state.unwrap().mint.decimals,
+                    self.oracle_state.unwrap().result.yielding_token_price
+                )
+                .map_err(|e| anyhow::anyhow!("Failed to calculate {:?}", e))?;
+
+            (out_amount, fee)
+        };
+
+        let fee_bps = if is_mint {
+            self.vault_state.config.minting_fee_bps
+        } else {
+            self.vault_state.config.burning_fee_bps
+        };
+
+        Ok(Quote {
+            in_amount,
+            out_amount: out_amount,
+            fee_amount: fee,
+            fee_mint: yielding_mint,
+            fee_pct: Decimal::new(fee_bps.into(), 4),
+        })
+    }
+
     fn get_swap_and_account_metas(&self, swap_params: &SwapParams) -> Result<SwapAndAccountMetas> {
         let SwapParams { source_mint, destination_mint, token_transfer_authority, .. } =
             swap_params;
 
         let user = token_transfer_authority;
-        let is_mint = source_mint == &USDC_MINT;
+        let yielding_mint = Pubkey::from(self.vault_state.config.yielding_token_mint);
+        let is_mint = source_mint.eq(&yielding_mint);
 
         let (yielding_mint, bank_mint) = if is_mint {
             (source_mint, destination_mint)
@@ -148,10 +232,7 @@ impl Amm for BankinecoAmm {
                 yielding_mint: *yielding_mint,
                 bank_mint: *bank_mint,
                 team: self.team,
-                system_program: SystemProgramId,
-                token_program: anchor_spl::token::ID,
                 yielding_mint_program: self.yielding_mint_program,
-                associated_token_program: anchor_spl::associated_token::ID,
             }).try_into()?,
         })
     }
@@ -165,9 +246,8 @@ impl Amm for BankinecoAmm {
         false
     }
 
-    // Indicates that whether ExactOut mode is supported
     fn supports_exact_out(&self) -> bool {
-        false
+        true
     }
 
     fn clone_amm(&self) -> Box<dyn Amm + Send + Sync> {
