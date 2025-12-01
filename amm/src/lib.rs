@@ -1,5 +1,5 @@
 use anchor_spl::associated_token::get_associated_token_address;
-use bankineco_helpers::{ bank::BankState, oracle::OracleGenState, vault::VaultGenState, * };
+use bankineco_helpers::{ bank::BankState, oracle::OracleGenState, vault::VaultGenState };
 use jupiter_amm_interface::{
     AccountMap,
     Amm,
@@ -99,6 +99,41 @@ impl TryFrom<BankinecoSwapAction> for Vec<AccountMeta> {
     }
 }
 
+pub fn required_input_amount_u128(
+    is_mint: bool,
+    desired_out: u64,
+    yielding_mint_price: u64,
+    bank_mint_price: u64,
+    fee_bps: u16
+) -> u128 {
+    const BPS_DENOM: u128 = 10_000;
+
+    let fee_bps_u128 = fee_bps as u128;
+    let effective_bps = BPS_DENOM.checked_sub(fee_bps_u128).expect("fee_bps must be <= 10_000");
+
+    // Choose which price is input vs output based on direction.
+    let (price_in, price_out) = if is_mint {
+        (yielding_mint_price as u128, bank_mint_price as u128)
+    } else {
+        (bank_mint_price as u128, yielding_mint_price as u128)
+    };
+
+    // numerator = desired_out * price_out * BPS_DENOM
+    let numerator = (desired_out as u128)
+        .checked_mul(price_out)
+        .expect("overflow in desired_out * price_out")
+        .checked_mul(BPS_DENOM)
+        .expect("overflow in * BPS_DENOM");
+
+    // denominator = price_in * effective_bps
+    let denominator = price_in
+        .checked_mul(effective_bps)
+        .expect("overflow in price_in * effective_bps");
+
+    // ceil_div(numerator, denominator)
+    numerator.checked_add(denominator - 1).expect("overflow in ceil adjustment") / denominator
+}
+
 impl Amm for BankinecoAmm {
     fn from_keyed_account(keyed_account: &KeyedAccount, _amm_context: &AmmContext) -> Result<Self>
         where Self: Sized
@@ -154,19 +189,25 @@ impl Amm for BankinecoAmm {
         let yielding_mint = Pubkey::from(self.vault_state.config.yielding_token_mint);
         let is_mint = quote_params.input_mint.eq(&yielding_mint);
 
-        let in_amount = if quote_params.swap_mode == SwapMode::ExactIn {
+        let fee_bps = if is_mint {
+            self.vault_state.config.minting_fee_bps
+        } else {
+            self.vault_state.config.burning_fee_bps
+        };
+
+        let in_amount: u64 = if quote_params.swap_mode == SwapMode::ExactIn {
             quote_params.amount
         } else {
-            let bank_mint_price = self.bank_state
-                .unwrap()
-                .calculate_bank_mint_price()
-                .map_err(|e| anyhow::anyhow!("Failed to calculate {:?}", e))?;
+            let bank_mint_price = self.bank_state.unwrap().mint.price;
+            let yielding_mint_price = self.oracle_state.unwrap().result.yielding_token_price;
 
-            // if is_mint {
-            // } else {
-            // }
-
-            0
+            required_input_amount_u128(
+                is_mint,
+                quote_params.amount,
+                yielding_mint_price,
+                bank_mint_price,
+                fee_bps
+            ).try_into()?
         };
 
         let (out_amount, fee) = if is_mint {
@@ -191,12 +232,6 @@ impl Amm for BankinecoAmm {
                 .map_err(|e| anyhow::anyhow!("Failed to calculate {:?}", e))?;
 
             (out_amount, fee)
-        };
-
-        let fee_bps = if is_mint {
-            self.vault_state.config.minting_fee_bps
-        } else {
-            self.vault_state.config.burning_fee_bps
         };
 
         Ok(Quote {
